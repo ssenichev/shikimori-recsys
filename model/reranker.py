@@ -293,7 +293,7 @@ def train_stage3(
         milestones=[warmup_steps],
     )
 
-    scaler     = _GradScaler(enabled=(device.type == "cuda"))
+    scaler = _GradScaler(enabled=(device.type == "cuda"))
     grad_accum = cfg.get("s3_grad_accum", 2)
     reranker.to(device)
 

@@ -35,8 +35,12 @@ log = logging.getLogger(__name__)
 def build_cf_mappings(
     anime_df: pd.DataFrame,
     train_df: pd.DataFrame,
-) -> tuple[dict[int, int], dict[int, int]]:
-    """Build ID→index mappings for CF embeddings. Index 0 is reserved as padding."""
+) -> tuple[dict[int, int], dict[int, int], int, int]:
+    """Build ID→index mappings for CF embeddings. Index 0 is reserved as padding.
+
+    Returns (item_id_to_idx, user_id_to_idx, n_items, n_users) where
+    n_items/n_users are the embedding table sizes (max_index + 1).
+    """
     item_id_to_idx: dict[int, int] = {}
     for i, aid in enumerate(anime_df["id"].astype(int).tolist(), start=1):
         item_id_to_idx[aid] = i
@@ -45,7 +49,10 @@ def build_cf_mappings(
     for i, uid in enumerate(sorted(train_df["user_id"].unique()), start=1):
         user_id_to_idx[int(uid)] = i
 
-    return item_id_to_idx, user_id_to_idx
+    n_items = max(item_id_to_idx.values()) + 1 if item_id_to_idx else 1
+    n_users = max(user_id_to_idx.values()) + 1 if user_id_to_idx else 1
+
+    return item_id_to_idx, user_id_to_idx, n_items, n_users
 
 
 def tokenise_batch(
@@ -293,7 +300,7 @@ def train_stage2(
         model.train()
 
         # Build CF ID mappings
-        item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, train_df)
+        item_id_to_cf_idx, user_id_to_cf_idx, _, _ = build_cf_mappings(anime_df, train_df)
 
         log.info("  Building item embedding cache...")
         item_matrix, id_to_idx = build_item_embedding_cache(
@@ -398,7 +405,7 @@ def evaluate_epoch(
         context_source = train_df
 
     # Build CF mappings for evaluation
-    item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, context_source)
+    item_id_to_cf_idx, user_id_to_cf_idx, _, _ = build_cf_mappings(anime_df, context_source)
 
     item_matrix, id_to_idx = build_item_embedding_cache(
         model, tokenizer, anime_df, cfg, device,
@@ -525,9 +532,7 @@ def run_hpo(
     hpo_epochs = max(1, base_cfg.get("s2_epochs", 5) // 3)
 
     # Pre-build CF mappings for HPO trials
-    item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, train_df)
-    n_items_cf = len(item_id_to_cf_idx) + 1  # +1 for padding idx 0
-    n_users_cf = len(user_id_to_cf_idx) + 1
+    item_id_to_cf_idx, user_id_to_cf_idx, n_items_cf, n_users_cf = build_cf_mappings(anime_df, train_df)
 
     def objective(trial: "optuna.Trial") -> float:
         proj_dim = trial.suggest_categorical("proj_dim", [64, 128, 256])
@@ -639,7 +644,7 @@ def run_hpo_reranker(
     hpo_epochs = max(1, base_cfg.get("s3_epochs", 3) // 2)
 
     # Build CF mappings for reranker HPO
-    _item_cf, _user_cf = build_cf_mappings(anime_df, train_df)
+    _item_cf, _user_cf, _, _ = build_cf_mappings(anime_df, train_df)
 
     log.info("Pre-building two-tower catalogue for reranker HPO...")
     _tmp_recommender = TwoTowerWithReranker(
@@ -774,7 +779,7 @@ DEFAULT_CFG = {
     "s1_grad_accum": 4, 
     "s1_lr": 2e-5,
     "s1_warmup_steps": 100,
-    "s1_max_length": 1024,
+    "s1_max_length": 512,
     "s1_neg_per_user": 5,
     "s1_grad_clip": 1.0,
     # Stage 2
@@ -783,7 +788,7 @@ DEFAULT_CFG = {
     "s2_grad_accum": 1,
     "s2_lr": 3e-4,
     "s2_warmup_steps": 200,
-    "s2_max_length": 1024,
+    "s2_max_length": 512,
     "s2_max_history": 50,
     "s2_grad_clip": 1.0,
     "s2_encode_batch": 128,
@@ -930,10 +935,11 @@ def main():
 
     if not args.skip_stage2:
         # Build CF mappings
-        item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, train_df)
+        item_id_to_cf_idx, user_id_to_cf_idx, n_items_cf, n_users_cf = build_cf_mappings(anime_df, train_df)
         cf_dim = cfg.get("cf_dim", 0)
-        n_items_cf = len(item_id_to_cf_idx) + 1 if cf_dim > 0 else 0
-        n_users_cf = len(user_id_to_cf_idx) + 1 if cf_dim > 0 else 0
+        if cf_dim == 0:
+            n_items_cf = 0
+            n_users_cf = 0
 
         model = TwoTowerModel(
             encoder_name=args.encoder,

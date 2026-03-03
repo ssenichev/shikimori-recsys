@@ -380,12 +380,14 @@ class TwoTowerWithReranker:
         reranker_tokenizer  = None,
         max_length: int = 128,
         rerank_max_length: int = 256,
+        item_id_to_cf_idx: Optional[dict[int, int]] = None,
+        user_id_to_cf_idx: Optional[dict[int, int]] = None,
     ):
         self.two_tower = two_tower
         self.reranker  = reranker
         self.tokenizer = tokenizer
         self.reranker_tokenizer = reranker_tokenizer if reranker_tokenizer is not None else tokenizer
-        
+
         if reranker_tokenizer is None:
             log.warning(
                 "TwoTowerWithReranker: reranker_tokenizer not provided, "
@@ -402,6 +404,10 @@ class TwoTowerWithReranker:
         self.id_to_text: dict[int, str] = {}
         self.id_to_name: dict[int, str] = {}
         self.item_matrix: Optional[torch.Tensor] = None
+
+        # CF mappings
+        self.item_id_to_cf_idx = item_id_to_cf_idx or {}
+        self.user_id_to_cf_idx = user_id_to_cf_idx or {}
 
         self._build_catalogue()
 
@@ -434,6 +440,18 @@ class TwoTowerWithReranker:
                 all_embs.append(embs.cpu())
 
         self.item_matrix = torch.cat(all_embs, dim=0)
+
+        # Fuse CF embeddings if available
+        if self.two_tower.has_cf and self.item_id_to_cf_idx:
+            cf_idxs = torch.tensor(
+                [self.item_id_to_cf_idx.get(aid, 0) for aid in ids],
+                dtype=torch.long,
+            )
+            with torch.no_grad():
+                self.item_matrix = self.two_tower.fuse_item_cf(
+                    self.item_matrix.to(self.device), cf_idxs.to(self.device)
+                ).cpu()
+
         log.info("Catalogue ready: %d items × %d dims", len(ids), self.item_matrix.shape[1])
 
     @torch.no_grad()
@@ -441,6 +459,7 @@ class TwoTowerWithReranker:
         self,
         user_history: pd.DataFrame,
         max_history: int = 50,
+        user_id: Optional[int] = None,
     ) -> torch.Tensor:
         if "created_at" in user_history.columns:
             history = user_history.sort_values("created_at").tail(max_history)
@@ -463,9 +482,15 @@ class TwoTowerWithReranker:
         ctx_scores= torch.tensor([list(context_scores)], dtype=torch.float).to(self.device)
         ctx_mask = torch.ones(1, len(context_ids), dtype=torch.bool).to(self.device)
 
+        # Build user CF index if available
+        user_idx = None
+        if self.two_tower.has_cf and user_id is not None and self.user_id_to_cf_idx:
+            cf_idx = self.user_id_to_cf_idx.get(int(user_id), 0)
+            user_idx = torch.tensor([cf_idx], dtype=torch.long).to(self.device)
+
         self.two_tower.eval()
         with autocast(device_type="cuda", enabled=(self.device.type == "cuda")):
-            user_vec = self.two_tower.encode_user(ctx_embs, ctx_scores, ctx_mask)
+            user_vec = self.two_tower.encode_user(ctx_embs, ctx_scores, ctx_mask, user_idx=user_idx)
         return user_vec.squeeze(0).cpu()
 
     @torch.no_grad()
@@ -498,13 +523,14 @@ class TwoTowerWithReranker:
         top_k: int = 10,
         retrieval_k: int = 100,
         exclude_seen: bool = True,
+        user_id: Optional[int] = None,
     ) -> list[dict]:
         assert self.item_matrix is not None, "Call _build_catalogue() first"
 
         if isinstance(user_history, list):
             user_history = _history_list_to_df(user_history)
 
-        user_vec = self._encode_user(user_history)
+        user_vec = self._encode_user(user_history, user_id=user_id)
         scores = (user_vec.unsqueeze(0) @ self.item_matrix.T).squeeze(0)
 
         if exclude_seen:

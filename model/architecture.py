@@ -212,9 +212,13 @@ class TwoTowerModel(nn.Module):
         lora_dropout: float = 0.05,
         pooling: str = "mean",
         gradient_checkpointing: bool = True,
+        n_items: int = 0,
+        n_users: int = 0,
+        cf_dim: int = 0,
     ):
         super().__init__()
         self.temperature = temperature
+        self.has_cf = n_items > 0 and cf_dim > 0
 
         self.item_tower = ItemTower(
             encoder_name=encoder_name,
@@ -233,6 +237,43 @@ class TwoTowerModel(nn.Module):
             dropout=dropout,
         )
 
+        if self.has_cf:
+            self.item_cf_emb = nn.Embedding(n_items, proj_dim, padding_idx=0)
+            nn.init.normal_(self.item_cf_emb.weight, mean=0.0, std=0.01)
+            with torch.no_grad():
+                self.item_cf_emb.weight[0].zero_()
+
+            self.user_cf_emb = nn.Embedding(n_users, proj_dim, padding_idx=0)
+            nn.init.normal_(self.user_cf_emb.weight, mean=0.0, std=0.01)
+            with torch.no_grad():
+                self.user_cf_emb.weight[0].zero_()
+
+            self.cf_gate = nn.Parameter(torch.tensor(-2.2))  # sigmoid(-2.2) ≈ 0.1
+
+    def fuse_item_cf(
+        self,
+        text_embs: torch.Tensor,
+        item_idxs: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.has_cf:
+            return text_embs
+        cf = self.item_cf_emb(item_idxs)
+        gate = torch.sigmoid(self.cf_gate)
+        fused = text_embs + gate * cf
+        return F.normalize(fused, p=2, dim=-1)
+
+    def fuse_user_cf(
+        self,
+        user_embs: torch.Tensor,
+        user_idxs: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.has_cf:
+            return user_embs
+        cf = self.user_cf_emb(user_idxs)
+        gate = torch.sigmoid(self.cf_gate)
+        fused = user_embs + gate * cf
+        return F.normalize(fused, p=2, dim=-1)
+
     def encode_texts(
         self,
         input_ids: torch.Tensor,
@@ -245,8 +286,12 @@ class TwoTowerModel(nn.Module):
         item_embeddings: torch.Tensor,
         context_scores:  torch.Tensor,
         context_mask:    torch.Tensor,
+        user_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.user_tower(item_embeddings, context_scores, context_mask)
+        user_embs = self.user_tower(item_embeddings, context_scores, context_mask)
+        if user_idx is not None and self.has_cf:
+            user_embs = self.fuse_user_cf(user_embs, user_idx)
+        return user_embs
 
     def forward(
         self,
@@ -255,9 +300,16 @@ class TwoTowerModel(nn.Module):
         context_item_embs: torch.Tensor,
         context_scores: torch.Tensor,
         context_mask: torch.Tensor,
+        target_item_idxs: Optional[torch.Tensor] = None,
+        user_idxs: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         target_embs = self.item_tower(target_input_ids, target_attn_mask)
+        if target_item_idxs is not None and self.has_cf:
+            target_embs = self.fuse_item_cf(target_embs, target_item_idxs)
+
         user_embs = self.user_tower(context_item_embs, context_scores, context_mask)
+        if user_idxs is not None and self.has_cf:
+            user_embs = self.fuse_user_cf(user_embs, user_idxs)
 
         logits = torch.matmul(user_embs, target_embs.T) / self.temperature
         labels = torch.arange(logits.size(0), device=logits.device)

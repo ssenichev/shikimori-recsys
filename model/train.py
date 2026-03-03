@@ -32,6 +32,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def build_cf_mappings(
+    anime_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Build ID→index mappings for CF embeddings. Index 0 is reserved as padding."""
+    item_id_to_idx: dict[int, int] = {}
+    for i, aid in enumerate(anime_df["id"].astype(int).tolist(), start=1):
+        item_id_to_idx[aid] = i
+
+    user_id_to_idx: dict[int, int] = {}
+    for i, uid in enumerate(sorted(train_df["user_id"].unique()), start=1):
+        user_id_to_idx[int(uid)] = i
+
+    return item_id_to_idx, user_id_to_idx
+
+
 def tokenise_batch(
     texts: list[str],
     tokenizer,
@@ -162,6 +178,7 @@ def build_item_embedding_cache(
     anime_df: pd.DataFrame,
     cfg: dict,
     device: torch.device,
+    item_id_to_cf_idx: Optional[dict[int, int]] = None,
 ) -> tuple[torch.Tensor, dict[int, int]]:
     model.eval()
     e5_prefix = "passage: "
@@ -180,6 +197,17 @@ def build_item_embedding_cache(
         all_embs.append(embs.cpu())
 
     item_matrix = torch.cat(all_embs, dim=0)
+
+    # Fuse CF embeddings if available
+    if model.has_cf and item_id_to_cf_idx is not None:
+        cf_idxs = torch.tensor(
+            [item_id_to_cf_idx.get(aid, 0) for aid in anime_ids],
+            dtype=torch.long,
+        )
+        item_matrix = model.fuse_item_cf(
+            item_matrix.to(device), cf_idxs.to(device)
+        ).cpu()
+
     return item_matrix, id_to_idx
 
 
@@ -264,9 +292,13 @@ def train_stage2(
     for epoch in range(1, cfg["s2_epochs"] + 1):
         model.train()
 
+        # Build CF ID mappings
+        item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, train_df)
+
         log.info("  Building item embedding cache...")
         item_matrix, id_to_idx = build_item_embedding_cache(
-            model, tokenizer, anime_df, cfg, device
+            model, tokenizer, anime_df, cfg, device,
+            item_id_to_cf_idx=item_id_to_cf_idx if model.has_cf else None,
         )
 
         epoch_loss = 0.0
@@ -280,6 +312,19 @@ def train_stage2(
                 batch, item_matrix, id_to_idx, device
             )
 
+            # Build CF index tensors for the batch
+            target_item_idxs = None
+            user_idxs = None
+            if model.has_cf:
+                target_item_idxs = torch.tensor(
+                    [item_id_to_cf_idx.get(int(tid), 0) for tid in batch["target_ids"].tolist()],
+                    dtype=torch.long,
+                ).to(device)
+                user_idxs = torch.tensor(
+                    [user_id_to_cf_idx.get(int(uid), 0) for uid in batch["user_ids"].tolist()],
+                    dtype=torch.long,
+                ).to(device)
+
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=(device.type == "cuda")):
                 out = model(
@@ -288,6 +333,8 @@ def train_stage2(
                     context_item_embs=context_embs,
                     context_scores=context_scores,
                     context_mask=context_mask,
+                    target_item_idxs=target_item_idxs,
+                    user_idxs=user_idxs,
                 )
                 loss = out["loss"]
 
@@ -350,8 +397,12 @@ def evaluate_epoch(
     else:
         context_source = train_df
 
+    # Build CF mappings for evaluation
+    item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, context_source)
+
     item_matrix, id_to_idx = build_item_embedding_cache(
-        model, tokenizer, anime_df, cfg, device
+        model, tokenizer, anime_df, cfg, device,
+        item_id_to_cf_idx=item_id_to_cf_idx if model.has_cf else None,
     )
 
     id_to_text = build_id_to_text(anime_df)
@@ -388,8 +439,17 @@ def evaluate_epoch(
         ctx_embs, ctx_scores, ctx_mask = _build_user_batch_context(
             batch, item_matrix, id_to_idx, device
         )
+
+        # Build user CF indices for the batch
+        user_idx = None
+        if model.has_cf:
+            user_idx = torch.tensor(
+                [user_id_to_cf_idx.get(int(uid), 0) for uid in batch["user_ids"].tolist()],
+                dtype=torch.long,
+            ).to(device)
+
         with autocast(enabled=(device.type == "cuda")):
-            user_embs = model.encode_user(ctx_embs, ctx_scores, ctx_mask)  # [B, D]
+            user_embs = model.encode_user(ctx_embs, ctx_scores, ctx_mask, user_idx=user_idx)
 
         for uid, emb in zip(batch["user_ids"].tolist(), user_embs.cpu()):
             user_emb_map[uid] = emb
@@ -464,16 +524,24 @@ def run_hpo(
     tokenizer = AutoTokenizer.from_pretrained(encoder_name)
     hpo_epochs = max(1, base_cfg.get("s2_epochs", 5) // 3)
 
+    # Pre-build CF mappings for HPO trials
+    item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, train_df)
+    n_items_cf = len(item_id_to_cf_idx) + 1  # +1 for padding idx 0
+    n_users_cf = len(user_id_to_cf_idx) + 1
+
     def objective(trial: "optuna.Trial") -> float:
         proj_dim = trial.suggest_categorical("proj_dim", [64, 128, 256])
 
         valid_nheads = [n for n in [2, 4, 8] if proj_dim % n == 0]
         nhead = trial.suggest_categorical("nhead", valid_nheads)
 
+        cf_dim = trial.suggest_categorical("cf_dim", [0, 32, 64, 128])
+
         cfg = {
             **base_cfg,
             "proj_dim": proj_dim,
             "nhead": nhead,
+            "cf_dim": cf_dim,
             "temperature": trial.suggest_float("temperature",  0.03, 0.15),
             "s2_lr": trial.suggest_float("s2_lr",        1e-5, 5e-4, log=True),
             "s2_batch_size": trial.suggest_categorical("s2_batch_size", [128, 256, 512]),
@@ -497,6 +565,9 @@ def run_hpo(
             freeze_mode=base_cfg.get("freeze_mode", "lora"),
             lora_rank=cfg["lora_rank"],
             lora_alpha=float(cfg["lora_rank"]) * 2,
+            n_items=n_items_cf if cf_dim > 0 else 0,
+            n_users=n_users_cf if cf_dim > 0 else 0,
+            cf_dim=cf_dim,
         )
 
         try:
@@ -567,6 +638,9 @@ def run_hpo_reranker(
     s3_tokenizer = AutoTokenizer.from_pretrained(reranker_encoder)
     hpo_epochs = max(1, base_cfg.get("s3_epochs", 3) // 2)
 
+    # Build CF mappings for reranker HPO
+    _item_cf, _user_cf = build_cf_mappings(anime_df, train_df)
+
     log.info("Pre-building two-tower catalogue for reranker HPO...")
     _tmp_recommender = TwoTowerWithReranker(
         two_tower=two_tower_model,
@@ -577,6 +651,8 @@ def run_hpo_reranker(
         reranker_tokenizer=s3_tokenizer,
         anime_df=anime_df,
         device=device,
+        item_id_to_cf_idx=_item_cf if two_tower_model.has_cf else None,
+        user_id_to_cf_idx=_user_cf if two_tower_model.has_cf else None,
     )
     item_matrix = _tmp_recommender.item_matrix
     id_to_idx = _tmp_recommender.id_to_idx
@@ -634,6 +710,8 @@ def run_hpo_reranker(
         recommender.idx_to_id = idx_to_id
         recommender.id_to_text = id_to_text
         recommender.id_to_name = id_to_name
+        recommender.item_id_to_cf_idx = _item_cf if two_tower_model.has_cf else {}
+        recommender.user_id_to_cf_idx = _user_cf if two_tower_model.has_cf else {}
 
         try:
             metrics = evaluate_reranker(
@@ -720,6 +798,7 @@ DEFAULT_CFG = {
     "lora_dropout": 0.05,
     "freeze_mode": "lora",
     "pooling": "mean",
+    "cf_dim": 128,
     "eval_ks": [5, 10, 20],
     "num_workers": 2,
     # Stage 3 — cross-encoder reranker
@@ -850,6 +929,12 @@ def main():
         log.info("Skipping Stage 1 (--skip_stage1)")
 
     if not args.skip_stage2:
+        # Build CF mappings
+        item_id_to_cf_idx, user_id_to_cf_idx = build_cf_mappings(anime_df, train_df)
+        cf_dim = cfg.get("cf_dim", 0)
+        n_items_cf = len(item_id_to_cf_idx) + 1 if cf_dim > 0 else 0
+        n_users_cf = len(user_id_to_cf_idx) + 1 if cf_dim > 0 else 0
+
         model = TwoTowerModel(
             encoder_name=args.encoder,
             proj_dim=cfg["proj_dim"],
@@ -861,6 +946,9 @@ def main():
             lora_alpha=cfg.get("lora_alpha", 16.0),
             lora_dropout=cfg.get("lora_dropout", 0.05),
             pooling=cfg.get("pooling", "mean"),
+            n_items=n_items_cf,
+            n_users=n_users_cf,
+            cf_dim=cf_dim,
         )
 
         if stage1_weights_path.exists() and not args.skip_stage1:

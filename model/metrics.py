@@ -112,7 +112,7 @@ def evaluate_reranker(
                 continue
 
             try:
-                user_vec = recommender._encode_user(ctx)
+                user_vec = recommender._encode_user(ctx, user_id=uid)
             except Exception as e:
                 log.warning("User %d encode failed: %s", uid, e)
                 ranks_reranked.append(float("inf"))

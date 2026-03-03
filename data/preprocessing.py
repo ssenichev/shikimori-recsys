@@ -289,12 +289,12 @@ def process_interactions(
     df = df[df["anime_id"].isin(known_ids)].copy()
     log.info("Dropped %d interactions for unknown anime_id", before - len(df))
 
-    explicit_counts = df[df["is_explicit"]].groupby("user_id").size()
-    active_users = explicit_counts[explicit_counts >= MIN_RATINGS_PER_USER].index
+    interaction_counts = df.groupby("user_id").size()
+    active_users = interaction_counts[interaction_counts >= MIN_RATINGS_PER_USER].index
     before = len(df)
     df = df[df["user_id"].isin(active_users)].copy()
     log.info(
-        "Removed users with < %d explicit ratings. Kept: %d users  %d rows",
+        "Removed users with < %d total interactions (explicit+implicit). Kept: %d users  %d rows",
         MIN_RATINGS_PER_USER, df["user_id"].nunique(), len(df),
     )
 

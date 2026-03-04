@@ -50,7 +50,7 @@ except ImportError:
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
 log = logging.getLogger(__name__)
 
@@ -108,32 +108,58 @@ def build_user_profile_text(
     return " | ".join(parts)
 
 class CrossEncoderReranker(nn.Module):
+    """Cross-encoder reranker supporting two modes:
+
+    1. **Custom head** (default for generic encoders like distilbert):
+       Uses ``AutoModel`` + a trainable ``Linear(hidden, 1)`` head.
+    2. **Pretrained reranker head** (for models like ``BAAI/bge-reranker-v2-m3``):
+       Uses ``AutoModelForSequenceClassification`` whose built-in head
+       was already trained for relevance scoring.  Set
+       ``pretrained_reranker=True`` to enable this mode.
+    """
+
     def __init__(
         self,
-        encoder_name: str = "distilbert-base-multilingual-cased",
+        encoder_name: str = "BAAI/bge-reranker-v2-m3",
         dropout: float = 0.1,
+        pretrained_reranker: bool = False,
     ):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(encoder_name)
-        hidden_dim = self.encoder.config.hidden_size
+        self.pretrained_reranker = pretrained_reranker
 
-        if hasattr(self.encoder, "gradient_checkpointing_enable"):
-            self.encoder.gradient_checkpointing_enable()
-
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        if pretrained_reranker:
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                encoder_name,
+            )
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            self.encoder = None
+            self.head = None
+        else:
+            self.encoder = AutoModel.from_pretrained(encoder_name)
+            hidden_dim = self.encoder.config.hidden_size
+            if hasattr(self.encoder, "gradient_checkpointing_enable"):
+                self.encoder.gradient_checkpointing_enable()
+            self.head = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.model = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls = out.last_hidden_state[:, 0, :]
-        logits = self.head(cls).squeeze(-1)
-        return torch.sigmoid(logits)
+        if self.pretrained_reranker:
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = out.logits.view(-1).float()
+            return torch.sigmoid(logits)
+        else:
+            out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            cls = out.last_hidden_state[:, 0, :]
+            logits = self.head(cls).squeeze(-1)
+            return torch.sigmoid(logits)
 
 class RerankerDataset(Dataset):
     def __init__(
@@ -263,9 +289,11 @@ def train_stage3(
         for _, row in anime_df.iterrows()
     }
 
+    e5_prefix = "" if reranker.pretrained_reranker else "passage: "
     train_ds = RerankerDataset(
         train_df, anime_df, id_to_name,
         negatives_per_user=cfg.get("s3_neg_per_user", 3),
+        e5_prefix=e5_prefix,
     )
 
     _collate = lambda batch: collate_reranker(batch, tokenizer, cfg["s3_max_length"])
@@ -501,7 +529,9 @@ class TwoTowerWithReranker:
     ) -> list[tuple[int, float]]:
         self.reranker.eval()
         texts = [profile_text] * len(candidate_ids)
-        animes = ["passage: " + self.id_to_text.get(aid, "") for aid in candidate_ids]
+        # Only add e5 prefix when the reranker uses a custom head (not a pretrained reranker)
+        prefix = "" if self.reranker.pretrained_reranker else "passage: "
+        animes = [prefix + self.id_to_text.get(aid, "") for aid in candidate_ids]
 
         enc = self.reranker_tokenizer(
             texts, animes,

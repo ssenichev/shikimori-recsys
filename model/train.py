@@ -696,7 +696,7 @@ def run_hpo_reranker(
     output_dir: Path,
     device: torch.device,
     n_trials: int = 20,
-    reranker_encoder: str = "distilbert-base-multilingual-cased",
+    reranker_encoder: Optional[str] = None,
 ) -> dict:
     try:
         import optuna
@@ -710,6 +710,8 @@ def run_hpo_reranker(
     )
     from model.metrics import evaluate_reranker
 
+    if reranker_encoder is None:
+        reranker_encoder = base_cfg.get("s3_encoder", "BAAI/bge-reranker-v2-m3")
     s3_tokenizer = AutoTokenizer.from_pretrained(reranker_encoder)
     hpo_epochs = max(1, base_cfg.get("s3_epochs", 3) // 2)
 
@@ -719,7 +721,10 @@ def run_hpo_reranker(
     log.info("Pre-building two-tower catalogue for reranker HPO...")
     _tmp_recommender = TwoTowerWithReranker(
         two_tower=two_tower_model,
-        reranker=CrossEncoderReranker(encoder_name=reranker_encoder),
+        reranker=CrossEncoderReranker(
+            encoder_name=reranker_encoder,
+            pretrained_reranker=base_cfg.get("s3_pretrained_reranker", False),
+        ),
         tokenizer=AutoTokenizer.from_pretrained(
             base_cfg.get("encoder", "intfloat/multilingual-e5-base")
         ),
@@ -756,6 +761,7 @@ def run_hpo_reranker(
         reranker = CrossEncoderReranker(
             encoder_name=reranker_encoder,
             dropout=cfg["dropout"],
+            pretrained_reranker=cfg.get("s3_pretrained_reranker", False),
         )
 
         try:
@@ -880,7 +886,8 @@ DEFAULT_CFG = {
     "eval_ks": [5, 10, 20],
     "num_workers": 2,
     # Stage 3 — cross-encoder reranker
-    "s3_encoder": "distilbert-base-multilingual-cased",
+    "s3_encoder": "BAAI/bge-reranker-v2-m3",
+    "s3_pretrained_reranker": True,
     "s3_epochs": 1,
     "s3_batch_size": 16,
     "s3_grad_accum": 4,
@@ -1077,6 +1084,7 @@ def main():
         reranker = CrossEncoderReranker(
             encoder_name=cfg["s3_encoder"],
             dropout=cfg.get("dropout", 0.1),
+            pretrained_reranker=cfg.get("s3_pretrained_reranker", False),
         )
         reranker = train_stage3(
             reranker, s3_tokenizer,

@@ -31,16 +31,17 @@ A two-stage anime recommendation system for the [Shikimori](https://shikimori.on
  |  ItemTower          UserTower            |
  |  +-----------+      +----------------+  |
  |  | e5-base   |      | Score proj     |  |
- |  | + LoRA    |      | Multi-head     |  |
- |  | + proj    |      |  attention     |  |
- |  | -> 128D   |      | Mean pool      |  |
- |  +-----------+      | -> 128D        |  |
+ |  | + LoRA    |      | Transformer    |  |
+ |  | + CF emb  |      |  Encoder (2L)  |  |
+ |  | + proj    |      | + CF emb       |  |
+ |  | -> 256D   |      | Mean pool      |  |
+ |  +-----------+      | -> 256D        |  |
  |       |             +----------------+  |
  |       v                    v            |
  |     item_emb           user_emb         |
  |        \                 /              |
  |         \               /               |
- |    In-batch sampled-softmax loss        |
+ |    In-batch + hard-negative loss        |
  +------------------------------------------+
        |  trained two-tower weights
        v
@@ -63,8 +64,8 @@ A two-stage anime recommendation system for the [Shikimori](https://shikimori.on
        |
        v
  +--------------------------+
- | UserTower Encoding       |    Multi-head attention over
- | -> 128D user embedding   |    watched items + scores
+ | UserTower Encoding       |    TransformerEncoder over
+ | -> 256D user embedding   |    watched items + scores + CF
  +--------------------------+
        |
        v
@@ -105,8 +106,8 @@ shikimori-recsys/
 
 | Component | Model | Purpose |
 |---|---|---|
-| **ItemTower** | `intfloat/multilingual-e5-base` + LoRA | Encodes anime text -> 128D embedding |
-| **UserTower** | Multi-head attention (4 heads) | Aggregates user history -> 128D embedding |
+| **ItemTower** | `intfloat/multilingual-e5-base` + LoRA + CF embeddings | Encodes anime text -> 256D embedding |
+| **UserTower** | TransformerEncoder (2 layers, 4 heads) + CF embeddings | Aggregates user history -> 256D embedding |
 | **Reranker** | `distilbert-base-multilingual-cased` | Scores (user_profile, anime) pairs jointly |
 
 ## Installation
@@ -175,6 +176,14 @@ s1_model = train_stage1(
 torch.save(s1_model.tower.state_dict(), output_dir / "stage1_encoder.pt")
 
 # --- Stage 2: Two-Tower training ---
+from model.train import build_cf_mappings
+
+item_id_to_cf_idx, user_id_to_cf_idx, n_items_cf, n_users_cf = build_cf_mappings(anime_df, train_df)
+cf_dim = cfg.get("cf_dim", 0)
+if cf_dim == 0:
+    n_items_cf = 0
+    n_users_cf = 0
+
 model = TwoTowerModel(
     encoder_name=ENCODER,
     proj_dim=cfg["proj_dim"],
@@ -183,6 +192,10 @@ model = TwoTowerModel(
     dropout=cfg["dropout"],
     freeze_mode=cfg["freeze_mode"],
     lora_rank=cfg["lora_rank"],
+    n_items=n_items_cf,
+    n_users=n_users_cf,
+    cf_dim=cf_dim,
+    user_tower_layers=cfg.get("user_tower_layers", 1),
 )
 # Load pretrained item tower from Stage 1
 state = torch.load(output_dir / "stage1_encoder.pt", map_location="cpu")
@@ -245,13 +258,27 @@ with open(model_dir / "config.json") as f:
 
 # Load two-tower model
 tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+
+from model.train import build_cf_mappings
+import pandas as pd
+
+anime_df = pd.read_parquet("processed_data/anime_processed.parquet")
+train_df = pd.read_parquet("processed_data/train_interactions.parquet")
+item_id_to_cf_idx, user_id_to_cf_idx, n_items_cf, n_users_cf = build_cf_mappings(anime_df, train_df)
+cf_dim = cfg.get("cf_dim", 0)
+if cf_dim == 0:
+    n_items_cf = 0
+    n_users_cf = 0
+
 model = TwoTowerModel(
     encoder_name="intfloat/multilingual-e5-base",
     proj_dim=cfg["proj_dim"], nhead=cfg["nhead"],
     temperature=cfg["temperature"], dropout=cfg["dropout"],
     freeze_mode=cfg["freeze_mode"], lora_rank=cfg["lora_rank"],
+    n_items=n_items_cf, n_users=n_users_cf, cf_dim=cf_dim,
+    user_tower_layers=cfg.get("user_tower_layers", 1),
 )
-model.load_state_dict(torch.load(model_dir / "model.pt", map_location="cpu"))
+model.load_state_dict(torch.load(model_dir / "model.pt", map_location="cpu"), strict=False)
 model.to(device).eval()
 
 # Load reranker
@@ -259,9 +286,6 @@ s3_tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "reranker_tokenizer
 reranker = CrossEncoderReranker(encoder_name=cfg["s3_encoder"])
 reranker.load_state_dict(torch.load(model_dir / "reranker.pt", map_location="cpu"))
 reranker.to(device).eval()
-
-# Load anime metadata
-anime_df = pd.read_parquet("processed_data/anime_processed.parquet")
 ```
 
 ### Getting Recommendations
@@ -324,6 +348,47 @@ for r in recs:
    9. Violet Evergarden                       (score: 0.821)
   10. Hunter x Hunter                         (score: 0.819)
 ```
+
+## Training Features
+
+### Hard Negative Mining (Stage 2)
+
+Instead of relying solely on in-batch negatives, the training loop mines hard negatives from the full item catalog each step:
+- Computes `user_embs @ item_matrix.T` to find the highest-scoring non-target items
+- Selects top-K hard negatives per user (default K=256)
+- Concatenates in-batch logits `[B, B]` with hard negative logits `[B, K]` -> `[B, B+K]`
+- In-batch targets and true targets are masked out from hard negative candidates
+
+This dramatically increases the effective number of negatives the model sees per step (from ~31 with batch_size=32 to 256+ hard negatives plus 255 in-batch negatives with batch_size=256).
+
+### Deeper UserTower
+
+The UserTower uses a `nn.TransformerEncoder` with Pre-LN (Layer Normalization before attention) for stable training:
+- Configurable depth via `user_tower_layers` (default: 2)
+- `dim_feedforward = proj_dim * 4` for each layer
+- Score-conditioned: item embeddings are summed with projected score embeddings before the transformer
+
+### Collaborative Filtering Embeddings
+
+Both towers incorporate learnable CF embeddings (gated fusion):
+- `item_cf_emb`: per-item embedding fused with text embedding via a learned gate
+- `user_cf_emb`: per-user embedding fused with attention output
+- Gate initialized at sigmoid(-2.2) ~ 0.1, allowing the model to gradually increase CF influence
+
+### Seen-Item Masking in Evaluation
+
+`evaluate_retrieval` masks out items already in the user's history before computing ranks, preventing inflated metrics from re-recommending seen items.
+
+### Default Configuration
+
+| Parameter | Value | Description |
+|---|---|---|
+| `proj_dim` | 256 | Embedding dimensionality |
+| `user_tower_layers` | 2 | TransformerEncoder depth |
+| `s2_batch_size` | 256 | Stage 2 batch size |
+| `s2_hard_neg_k` | 256 | Hard negatives per user per step |
+| `cf_dim` | 128 | CF embedding dimension |
+| `temperature` | 0.07 | Softmax temperature |
 
 ## Evaluation Metrics
 

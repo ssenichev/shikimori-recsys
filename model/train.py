@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -311,6 +312,14 @@ def train_stage2(
         epoch_loss = 0.0
         t0 = time.time()
 
+        hard_neg_k = cfg.get("s2_hard_neg_k", 0)
+        grad_accum = cfg.get("s2_grad_accum", 1)
+        optimizer.zero_grad(set_to_none=True)
+
+        # Pre-compute item matrix on device for hard negative mining
+        if hard_neg_k > 0:
+            item_matrix_device = item_matrix.to(device)
+
         for step, batch in enumerate(train_loader, 1):
             target_enc = tokenise_batch(
                 batch["target_texts"], tokenizer, cfg["s2_max_length"], device
@@ -332,7 +341,6 @@ def train_stage2(
                     dtype=torch.long,
                 ).to(device)
 
-            optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=(device.type == "cuda")):
                 out = model(
                     target_input_ids=target_enc["input_ids"],
@@ -343,22 +351,67 @@ def train_stage2(
                     target_item_idxs=target_item_idxs,
                     user_idxs=user_idxs,
                 )
-                loss = out["loss"]
+
+                if hard_neg_k > 0:
+                    user_embs = out["user_embs"]          # [B, D]
+                    target_embs = out["target_embs"]      # [B, D]
+                    B = user_embs.size(0)
+
+                    # Compute scores against full item catalog
+                    all_scores = torch.matmul(user_embs, item_matrix_device.T)  # [B, N]
+
+                    # Mask out true target items
+                    target_id_list = batch["target_ids"].tolist()
+                    for i, tid in enumerate(target_id_list):
+                        idx = id_to_idx.get(int(tid), None)
+                        if idx is not None:
+                            all_scores[i, idx] = -1e9
+
+                    # Also mask out other in-batch targets to avoid duplicates
+                    in_batch_idxs = set()
+                    for tid in target_id_list:
+                        idx = id_to_idx.get(int(tid), None)
+                        if idx is not None:
+                            in_batch_idxs.add(idx)
+                    for idx in in_batch_idxs:
+                        all_scores[:, idx] = -1e9
+
+                    # Pick top-K hard negatives per user
+                    _, hard_neg_indices = all_scores.topk(hard_neg_k, dim=1)  # [B, K]
+                    hard_neg_embs = item_matrix_device[hard_neg_indices]       # [B, K, D]
+
+                    # Compute hard negative logits
+                    hard_neg_logits = torch.bmm(
+                        hard_neg_embs, user_embs.unsqueeze(-1)
+                    ).squeeze(-1) / model.temperature  # [B, K]
+
+                    # In-batch logits from forward pass
+                    in_batch_logits = out["logits"]  # [B, B]
+
+                    # Concatenate: [B, B+K]
+                    combined_logits = torch.cat([in_batch_logits, hard_neg_logits], dim=1)
+                    labels = torch.arange(B, device=combined_logits.device)
+                    loss = F.cross_entropy(combined_logits, labels) / grad_accum
+                else:
+                    loss = out["loss"] / grad_accum
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("s2_grad_clip", 1.0))
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
 
-            epoch_loss += loss.item()
+            if step % grad_accum == 0 or step == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("s2_grad_clip", 1.0))
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss += loss.item() * grad_accum
 
             if step % 100 == 0:
                 log.info(
                     "S2 E%d/%d  step %d/%d  loss=%.4f  lr=%.2e",
                     epoch, cfg["s2_epochs"], step, len(train_loader),
-                    loss.item(), scheduler.get_last_lr()[0],
+                    loss.item() * grad_accum, scheduler.get_last_lr()[0],
                 )
 
         avg_loss = epoch_loss / len(train_loader)
@@ -481,11 +534,23 @@ def evaluate_epoch(
         covered, len(eval_user_ids),
     )
 
+    # Build per-user seen-item index lists for masking
+    seen_item_idxs = []
+    for uid in eval_user_ids:
+        user_ctx = context_source[context_source["user_id"] == uid]
+        seen = [
+            id_to_idx[int(aid)]
+            for aid in user_ctx["anime_id"].tolist()
+            if int(aid) in id_to_idx
+        ]
+        seen_item_idxs.append(seen)
+
     return evaluate_retrieval(
         user_embeddings=torch.stack(all_user_embs),
         item_embeddings=item_matrix,
         target_item_idxs=torch.tensor(all_target_idxs, dtype=torch.long),
         ks=list(ks),
+        seen_item_idxs=seen_item_idxs,
     )
 
 
@@ -541,12 +606,16 @@ def run_hpo(
         nhead = trial.suggest_categorical("nhead", valid_nheads)
 
         cf_dim = trial.suggest_categorical("cf_dim", [0, 32, 64, 128])
+        user_tower_layers = trial.suggest_int("user_tower_layers", 1, 3)
+        s2_hard_neg_k = trial.suggest_categorical("s2_hard_neg_k", [0, 64, 128, 256])
 
         cfg = {
             **base_cfg,
             "proj_dim": proj_dim,
             "nhead": nhead,
             "cf_dim": cf_dim,
+            "user_tower_layers": user_tower_layers,
+            "s2_hard_neg_k": s2_hard_neg_k,
             "temperature": trial.suggest_float("temperature",  0.03, 0.15),
             "s2_lr": trial.suggest_float("s2_lr",        1e-5, 5e-4, log=True),
             "s2_batch_size": trial.suggest_categorical("s2_batch_size", [128, 256, 512]),
@@ -573,6 +642,7 @@ def run_hpo(
             n_items=n_items_cf if cf_dim > 0 else 0,
             n_users=n_users_cf if cf_dim > 0 else 0,
             cf_dim=cf_dim,
+            user_tower_layers=user_tower_layers,
         )
 
         try:
@@ -784,7 +854,7 @@ DEFAULT_CFG = {
     "s1_grad_clip": 1.0,
     # Stage 2
     "s2_epochs": 20,
-    "s2_batch_size": 32,
+    "s2_batch_size": 256,
     "s2_grad_accum": 1,
     "s2_lr": 3e-4,
     "s2_warmup_steps": 200,
@@ -793,7 +863,7 @@ DEFAULT_CFG = {
     "s2_grad_clip": 1.0,
     "s2_encode_batch": 128,
     # Shared
-    "proj_dim": 128,
+    "proj_dim": 256,
     "nhead": 4,
     "temperature": 0.07,
     "dropout": 0.1,
@@ -804,6 +874,8 @@ DEFAULT_CFG = {
     "freeze_mode": "lora",
     "pooling": "mean",
     "cf_dim": 128,
+    "user_tower_layers": 2,
+    "s2_hard_neg_k": 256,
     "eval_ks": [5, 10, 20],
     "num_workers": 2,
     # Stage 3 — cross-encoder reranker
@@ -955,6 +1027,7 @@ def main():
             n_items=n_items_cf,
             n_users=n_users_cf,
             cf_dim=cf_dim,
+            user_tower_layers=cfg.get("user_tower_layers", 1),
         )
 
         if stage1_weights_path.exists() and not args.skip_stage1:

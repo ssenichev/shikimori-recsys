@@ -154,19 +154,24 @@ class UserTower(nn.Module):
         proj_dim: int = 128,
         nhead: int = 4,
         dropout: float = 0.1,
+        n_layers: int = 1,
     ):
         super().__init__()
         assert proj_dim % nhead == 0, "proj_dim must be divisible by nhead"
 
         self.score_proj = nn.Linear(1, proj_dim)
 
-        self.attn = nn.MultiheadAttention(
-            embed_dim=proj_dim,
-            num_heads=nhead,
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=proj_dim,
+            nhead=nhead,
+            dim_feedforward=proj_dim * 4,
             dropout=dropout,
             batch_first=True,
+            norm_first=True,
         )
-        self.attn_norm = nn.LayerNorm(proj_dim)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers,
+        )
 
         self.out_proj = nn.Sequential(
             nn.Dropout(dropout),
@@ -184,14 +189,9 @@ class UserTower(nn.Module):
         score_emb = self.score_proj(context_scores.unsqueeze(-1))
         ctx = item_embeddings + score_emb
 
-        key_padding_mask = ~context_mask
-        attn_out, _ = self.attn(
-            ctx, ctx, ctx,
-            key_padding_mask=key_padding_mask,
-        )
-        ctx = self.attn_norm(ctx + attn_out)
+        ctx = self.transformer(ctx, src_key_padding_mask=~context_mask)
 
-        valid_float   = context_mask.float().unsqueeze(-1)
+        valid_float = context_mask.float().unsqueeze(-1)
         user_vec = (ctx * valid_float).sum(dim=1) / valid_float.sum(dim=1).clamp(min=1)
 
         user_vec = self.out_proj(user_vec)
@@ -215,6 +215,7 @@ class TwoTowerModel(nn.Module):
         n_items: int = 0,
         n_users: int = 0,
         cf_dim: int = 0,
+        user_tower_layers: int = 1,
     ):
         super().__init__()
         self.temperature = temperature
@@ -235,6 +236,7 @@ class TwoTowerModel(nn.Module):
             proj_dim=proj_dim,
             nhead=nhead,
             dropout=dropout,
+            n_layers=user_tower_layers,
         )
 
         if self.has_cf:
@@ -315,7 +317,7 @@ class TwoTowerModel(nn.Module):
         labels = torch.arange(logits.size(0), device=logits.device)
 
         loss   = F.cross_entropy(logits, labels)
-        return {"loss": loss, "logits": logits}
+        return {"loss": loss, "logits": logits, "user_embs": user_embs, "target_embs": target_embs}
 
     @torch.no_grad()
     def encode_item_catalog(

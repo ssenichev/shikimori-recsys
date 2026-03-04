@@ -29,6 +29,7 @@ def evaluate_retrieval(
     target_item_idxs: torch.Tensor,
     ks: list[int] = (5, 10, 20),
     batch_size: int = 512,
+    seen_item_idxs: Optional[list[list[int]]] = None,
 ) -> dict[str, float]:
     user_embeddings = user_embeddings.float()
     item_embeddings = item_embeddings.float()
@@ -46,6 +47,13 @@ def evaluate_retrieval(
         targets = target_item_idxs[start:end]
 
         scores = torch.matmul(u_batch, item_embeddings.T)
+
+        if seen_item_idxs is not None:
+            for i in range(end - start):
+                seen = seen_item_idxs[start + i]
+                if seen:
+                    scores[i, seen] = -1e9
+
         sorted_idxs = torch.argsort(scores, dim=1, descending=True)
 
         for i in range(end - start):

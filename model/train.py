@@ -297,11 +297,15 @@ def train_stage2(
     best_metrics = {}
     ks = cfg.get("eval_ks", [5, 10, 20])
 
+    # Build CF ID mappings once (they don't change across epochs)
+    item_id_to_cf_idx, user_id_to_cf_idx, _, _ = build_cf_mappings(anime_df, train_df)
+
+    hard_neg_k = cfg.get("s2_hard_neg_k", 0)
+    grad_accum = cfg.get("s2_grad_accum", 1)
+    cache_refresh_steps = cfg.get("s2_cache_refresh_steps", 50)
+
     for epoch in range(1, cfg["s2_epochs"] + 1):
         model.train()
-
-        # Build CF ID mappings
-        item_id_to_cf_idx, user_id_to_cf_idx, _, _ = build_cf_mappings(anime_df, train_df)
 
         log.info("  Building item embedding cache...")
         item_matrix, id_to_idx = build_item_embedding_cache(
@@ -312,8 +316,6 @@ def train_stage2(
         epoch_loss = 0.0
         t0 = time.time()
 
-        hard_neg_k = cfg.get("s2_hard_neg_k", 0)
-        grad_accum = cfg.get("s2_grad_accum", 1)
         optimizer.zero_grad(set_to_none=True)
 
         # Pre-compute item matrix on device for hard negative mining
@@ -321,6 +323,17 @@ def train_stage2(
             item_matrix_device = item_matrix.to(device)
 
         for step, batch in enumerate(train_loader, 1):
+            # Refresh item embedding cache periodically to prevent staleness.
+            # The item tower weights change every optimizer step, so context
+            # embeddings (looked up from item_matrix) drift out of alignment.
+            if step > 1 and step % cache_refresh_steps == 0:
+                item_matrix, id_to_idx = build_item_embedding_cache(
+                    model, tokenizer, anime_df, cfg, device,
+                    item_id_to_cf_idx=item_id_to_cf_idx if model.has_cf else None,
+                )
+                if hard_neg_k > 0:
+                    item_matrix_device = item_matrix.to(device)
+
             target_enc = tokenise_batch(
                 batch["target_texts"], tokenizer, cfg["s2_max_length"], device
             )
@@ -868,6 +881,7 @@ DEFAULT_CFG = {
     "s2_max_history": 50,
     "s2_grad_clip": 1.0,
     "s2_encode_batch": 128,
+    "s2_cache_refresh_steps": 50,
     # Shared
     "proj_dim": 256,
     "nhead": 4,

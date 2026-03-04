@@ -274,6 +274,21 @@ def train_stage2(
         min_positives=1,
     )
 
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+    model.to(device)
+
+    # ── Freeze ItemTower + item-side CF during Stage 2 ──
+    # Stage 1 already fine-tuned the text encoder.  Keeping it frozen means
+    # the pre-computed item_matrix is always in sync with the model — no
+    # stale-cache problem.  Only UserTower + user CF embeddings are trained.
+    for p in model.item_tower.parameters():
+        p.requires_grad_(False)
+    if model.has_cf:
+        model.item_cf_emb.requires_grad_(False)
+        model.cf_gate.requires_grad_(False)
+    log.info("ItemTower + item CF frozen for Stage 2 — training UserTower + user CF only")
+
+    # Create optimizer AFTER freezing so it only tracks trainable params
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg["s2_lr"],
@@ -290,9 +305,6 @@ def train_stage2(
         milestones=[warmup_steps],
     )
 
-    scaler = GradScaler(enabled=(device.type == "cuda"))
-    model.to(device)
-
     best_ndcg   = -1.0
     best_metrics = {}
     ks = cfg.get("eval_ks", [5, 10, 20])
@@ -302,111 +314,83 @@ def train_stage2(
 
     hard_neg_k = cfg.get("s2_hard_neg_k", 0)
     grad_accum = cfg.get("s2_grad_accum", 1)
-    cache_refresh_steps = cfg.get("s2_cache_refresh_steps", 50)
+
+    # Build item embedding cache ONCE — valid for the entire training run
+    # since ItemTower is frozen.
+    log.info("  Building item embedding cache (one-time, ItemTower frozen)...")
+    item_matrix, id_to_idx = build_item_embedding_cache(
+        model, tokenizer, anime_df, cfg, device,
+        item_id_to_cf_idx=item_id_to_cf_idx if model.has_cf else None,
+    )
+    item_matrix_device = item_matrix.to(device)
 
     for epoch in range(1, cfg["s2_epochs"] + 1):
         model.train()
-
-        log.info("  Building item embedding cache...")
-        item_matrix, id_to_idx = build_item_embedding_cache(
-            model, tokenizer, anime_df, cfg, device,
-            item_id_to_cf_idx=item_id_to_cf_idx if model.has_cf else None,
-        )
 
         epoch_loss = 0.0
         t0 = time.time()
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Pre-compute item matrix on device for hard negative mining
-        if hard_neg_k > 0:
-            item_matrix_device = item_matrix.to(device)
-
         for step, batch in enumerate(train_loader, 1):
-            # Refresh item embedding cache periodically to prevent staleness.
-            # The item tower weights change every optimizer step, so context
-            # embeddings (looked up from item_matrix) drift out of alignment.
-            if step > 1 and step % cache_refresh_steps == 0:
-                item_matrix, id_to_idx = build_item_embedding_cache(
-                    model, tokenizer, anime_df, cfg, device,
-                    item_id_to_cf_idx=item_id_to_cf_idx if model.has_cf else None,
-                )
-                if hard_neg_k > 0:
-                    item_matrix_device = item_matrix.to(device)
-
-            target_enc = tokenise_batch(
-                batch["target_texts"], tokenizer, cfg["s2_max_length"], device
-            )
             context_embs, context_scores, context_mask = _build_user_batch_context(
                 batch, item_matrix, id_to_idx, device
             )
 
+            # Look up target embeddings from the frozen cache instead of
+            # encoding through ItemTower — consistent with context embeddings.
+            target_id_list = batch["target_ids"].tolist()
+            target_cache_idxs = torch.tensor(
+                [id_to_idx.get(int(tid), 0) for tid in target_id_list],
+                dtype=torch.long,
+            )
+            target_embs_cached = item_matrix_device[target_cache_idxs]  # [B, D]
+
             # Build CF index tensors for the batch
-            target_item_idxs = None
             user_idxs = None
             if model.has_cf:
-                target_item_idxs = torch.tensor(
-                    [item_id_to_cf_idx.get(int(tid), 0) for tid in batch["target_ids"].tolist()],
-                    dtype=torch.long,
-                ).to(device)
                 user_idxs = torch.tensor(
                     [user_id_to_cf_idx.get(int(uid), 0) for uid in batch["user_ids"].tolist()],
                     dtype=torch.long,
                 ).to(device)
 
             with autocast(enabled=(device.type == "cuda")):
-                out = model(
-                    target_input_ids=target_enc["input_ids"],
-                    target_attn_mask=target_enc["attention_mask"],
-                    context_item_embs=context_embs,
-                    context_scores=context_scores,
-                    context_mask=context_mask,
-                    target_item_idxs=target_item_idxs,
-                    user_idxs=user_idxs,
+                # Encode user only — target comes from frozen cache
+                user_embs = model.encode_user(
+                    context_embs, context_scores, context_mask,
+                    user_idx=user_idxs,
                 )
 
-                if hard_neg_k > 0:
-                    user_embs = out["user_embs"]          # [B, D]
-                    target_embs = out["target_embs"]      # [B, D]
-                    B = user_embs.size(0)
+                # In-batch sampled softmax: user_embs @ target_embs.T
+                in_batch_logits = torch.matmul(
+                    user_embs, target_embs_cached.T
+                ) / model.temperature  # [B, B]
 
-                    # Compute scores against full item catalog (detach for selection only)
+                B = user_embs.size(0)
+
+                if hard_neg_k > 0:
+                    # Hard negatives from the frozen item matrix
                     all_scores = torch.matmul(user_embs.detach(), item_matrix_device.T)  # [B, N]
 
-                    # Mask out true target items
-                    target_id_list = batch["target_ids"].tolist()
-                    for i, tid in enumerate(target_id_list):
-                        idx = id_to_idx.get(int(tid), None)
-                        if idx is not None:
-                            all_scores[i, idx] = -1e4
-
-                    # Also mask out other in-batch targets to avoid duplicates
-                    in_batch_idxs = set()
-                    for tid in target_id_list:
-                        idx = id_to_idx.get(int(tid), None)
-                        if idx is not None:
-                            in_batch_idxs.add(idx)
-                    for idx in in_batch_idxs:
+                    # Mask out in-batch targets
+                    in_batch_cache_idxs = set(target_cache_idxs.tolist())
+                    for idx in in_batch_cache_idxs:
                         all_scores[:, idx] = -1e4
 
                     # Pick top-K hard negatives per user
                     _, hard_neg_indices = all_scores.topk(hard_neg_k, dim=1)  # [B, K]
                     hard_neg_embs = item_matrix_device[hard_neg_indices]       # [B, K, D]
 
-                    # Compute hard negative logits
                     hard_neg_logits = torch.bmm(
                         hard_neg_embs, user_embs.unsqueeze(-1)
                     ).squeeze(-1) / model.temperature  # [B, K]
 
-                    # In-batch logits from forward pass
-                    in_batch_logits = out["logits"]  # [B, B]
-
-                    # Concatenate: [B, B+K]
                     combined_logits = torch.cat([in_batch_logits, hard_neg_logits], dim=1)
                     labels = torch.arange(B, device=combined_logits.device)
                     loss = F.cross_entropy(combined_logits, labels) / grad_accum
                 else:
-                    loss = out["loss"] / grad_accum
+                    labels = torch.arange(B, device=in_batch_logits.device)
+                    loss = F.cross_entropy(in_batch_logits, labels) / grad_accum
 
             scaler.scale(loss).backward()
 

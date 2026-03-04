@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from transformers import AutoTokenizer
@@ -132,7 +132,7 @@ def train_stage1(
             negative_enc = tokenise_batch(batch["negative_text"], tokenizer, cfg["s1_max_length"], device)
             score_gap = batch["score_gap"].to(device)
 
-            with autocast(enabled=(device.type == "cuda")):
+            with autocast(device.type, enabled=(device.type == "cuda")):
                 out = model(
                     anchor_ids=anchor_enc["input_ids"],
                     anchor_mask=anchor_enc["attention_mask"],
@@ -200,7 +200,7 @@ def build_item_embedding_cache(
     for i in range(0, len(texts), bs):
         batch_texts = texts[i : i + bs]
         enc = tokenise_batch(batch_texts, tokenizer, cfg["s2_max_length"], device)
-        with autocast(enabled=(device.type == "cuda")):
+        with autocast(device.type, enabled=(device.type == "cuda")):
             embs = model.item_tower(**enc)
         all_embs.append(embs.cpu())
 
@@ -354,7 +354,7 @@ def train_stage2(
                     dtype=torch.long,
                 ).to(device)
 
-            with autocast(enabled=(device.type == "cuda")):
+            with autocast(device.type, enabled=(device.type == "cuda")):
                 # Encode user only — target comes from frozen cache
                 user_embs = model.encode_user(
                     context_embs, context_scores, context_mask,
@@ -505,7 +505,7 @@ def evaluate_epoch(
                 dtype=torch.long,
             ).to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
+        with autocast(device.type, enabled=(device.type == "cuda")):
             user_embs = model.encode_user(ctx_embs, ctx_scores, ctx_mask, user_idx=user_idx)
 
         for uid, emb in zip(batch["user_ids"].tolist(), user_embs.cpu()):

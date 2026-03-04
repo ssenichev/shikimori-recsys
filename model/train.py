@@ -784,7 +784,7 @@ DEFAULT_CFG = {
     "s1_grad_clip": 1.0,
     # Stage 2
     "s2_epochs": 20,
-    "s2_batch_size": 128,
+    "s2_batch_size": 32,
     "s2_grad_accum": 1,
     "s2_lr": 3e-4,
     "s2_warmup_steps": 200,

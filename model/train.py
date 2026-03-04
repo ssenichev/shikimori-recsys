@@ -872,6 +872,7 @@ DEFAULT_CFG = {
     "lora_alpha": 16.0,
     "lora_dropout": 0.05,
     "freeze_mode": "lora",
+    "encoder": "intfloat/multilingual-e5-base",
     "pooling": "mean",
     "cf_dim": 128,
     "user_tower_layers": 2,

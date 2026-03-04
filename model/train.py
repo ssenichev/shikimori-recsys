@@ -758,12 +758,12 @@ def run_hpo_reranker(
         cfg = {
             **base_cfg,
             "s3_lr": trial.suggest_float("s3_lr",          1e-6, 1e-4, log=True),
-            "s3_batch_size": trial.suggest_categorical("s3_batch_size",   [8, 16, 32]),
+            # "s3_batch_size": trial.suggest_categorical("s3_batch_size",   [8, 16, 32]),
             "s3_grad_accum": trial.suggest_categorical("s3_grad_accum",   [2, 4, 8]),
             "s3_neg_per_user": trial.suggest_categorical("s3_neg_per_user", [1, 3, 5]),
-            "s3_max_length": trial.suggest_categorical("s3_max_length",   [128, 192, 256]),
+            "s3_max_length": trial.suggest_categorical("s3_max_length",   [128, 256]),
             "dropout": trial.suggest_float("dropout",          0.0,  0.3),
-            "retrieval_k": trial.suggest_categorical("retrieval_k",     [50, 100, 200]),
+            # "retrieval_k": trial.suggest_categorical("retrieval_k",     [50, 100, 200]),
             "s3_epochs": hpo_epochs,
             "s3_warmup_steps": 20,
         }
@@ -863,7 +863,7 @@ def run_hpo_reranker(
 
 DEFAULT_CFG = {
     # Stage 1
-    "s1_epochs": 3,
+    "s1_epochs": 7,
     "s1_batch_size": 32,
     "s1_grad_accum": 4, 
     "s1_lr": 2e-5,
@@ -872,10 +872,10 @@ DEFAULT_CFG = {
     "s1_neg_per_user": 5,
     "s1_grad_clip": 1.0,
     # Stage 2
-    "s2_epochs": 20,
+    "s2_epochs": 10,
     "s2_batch_size": 64,
-    "s2_grad_accum": 4,
-    "s2_lr": 3e-4,
+    "s2_grad_accum": 2,
+    "s2_lr": 3e-5,
     "s2_warmup_steps": 200,
     "s2_max_length": 512,
     "s2_max_history": 50,
@@ -896,15 +896,15 @@ DEFAULT_CFG = {
     "pooling": "mean",
     "cf_dim": 128,
     "user_tower_layers": 2,
-    "s2_hard_neg_k": 256,
+    "s2_hard_neg_k": 128,
     "eval_ks": [5, 10, 20],
     "num_workers": 2,
     # Stage 3 — cross-encoder reranker
     "s3_encoder": "BAAI/bge-reranker-v2-m3",
     "s3_pretrained_reranker": True,
-    "s3_epochs": 1,
-    "s3_batch_size": 16,
-    "s3_grad_accum": 4,
+    "s3_epochs": 3,
+    "s3_batch_size": 32,
+    "s3_grad_accum": 2,
     "s3_lr": 2e-5,
     "s3_warmup_steps": 50,
     "s3_max_length": 512,

@@ -82,11 +82,11 @@ class UserRatingsDataset(Dataset):
             for _, pos_row in positives.iterrows():
                 target_id = int(pos_row["anime_id"])
 
-                # Use chronological order: only items BEFORE the target
+                # Use chronological order: only items strictly BEFORE the target
                 if "created_at" in group.columns:
                     context = group[
                         (group["anime_id"] != target_id) &
-                        (group["created_at"] <= pos_row["created_at"])
+                        (group["created_at"] < pos_row["created_at"])
                     ].tail(max_history)
                 else:
                     context = group[group["anime_id"] != target_id].head(max_history)
@@ -141,16 +141,19 @@ class TripletDataset(Dataset):
         self.triplets: list[dict] = []
 
         for user_id, group in interactions.groupby("user_id"):
-            positives = group[group["score_raw"] >= SCORE_HIGH]
-            negatives = group[group["score_raw"] <= SCORE_LOW]
-            mid_range = group[(group["score_raw"] >= 5) & (group["score_raw"] <= 7)]
+            # Only use explicitly-scored items for triplet mining;
+            # implicit interactions (score_raw=0) are not reliable negatives.
+            scored = group[group["score_raw"] > 0] if "score_raw" in group.columns else group
+            positives = scored[scored["score_raw"] >= SCORE_HIGH]
+            negatives = scored[scored["score_raw"] <= SCORE_LOW]
+            mid_range = scored[(scored["score_raw"] >= 5) & (scored["score_raw"] <= 7)]
 
             if len(positives) == 0:
                 continue
 
-            # Fallback for negatives: take the lowest-scored items
+            # Fallback for negatives: take the lowest-scored explicit items
             if len(negatives) == 0:
-                negatives = group.nsmallest(max(1, len(group) // 4), "score_raw")
+                negatives = scored.nsmallest(max(1, len(scored) // 4), "score_raw")
 
             # Fallback for anchor: use positives
             anchors = mid_range if len(mid_range) > 0 else positives

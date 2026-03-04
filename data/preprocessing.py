@@ -30,6 +30,7 @@ SEASON_ORDER = {"winter": 0, "spring": 1, "summer": 2, "fall": 3}
 _SHIKI_TAG_RE = re.compile(r"\[/?[a-z]+=?\d*\]", re.IGNORECASE)
 MIN_RATINGS_PER_USER = 2
 SCORE_MIN, SCORE_MAX = 1, 10
+SCORE_HIGH = 7  # minimum score to be a valid retrieval target
 
 
 def _safe_literal(value, fallback=None):
@@ -282,6 +283,24 @@ def process_interactions(
     implicit["confidence"] = implicit["score_norm"]
     implicit["is_explicit"] = False
 
+    # Promote fully-watched but unrated anime to explicit score=7.
+    # Rationale: if a user finished (or nearly finished) a show without
+    # dropping it, that's a strong positive signal.  We treat it as a 7/10
+    # so these items become valid retrieval targets and training positives.
+    IMPLICIT_PROMOTE_THRESHOLD = 0.8   # completion_rate cutoff
+    IMPLICIT_PROMOTE_SCORE = 7
+    promote_mask = implicit["completion_rate"] >= IMPLICIT_PROMOTE_THRESHOLD
+    n_promoted = promote_mask.sum()
+    if n_promoted > 0:
+        implicit.loc[promote_mask, "score_raw"]    = IMPLICIT_PROMOTE_SCORE
+        implicit.loc[promote_mask, "score_norm"]   = _normalise_score(IMPLICIT_PROMOTE_SCORE)
+        implicit.loc[promote_mask, "confidence"]   = _normalise_score(IMPLICIT_PROMOTE_SCORE)
+        implicit.loc[promote_mask, "is_explicit"]  = True
+    log.info(
+        "Promoted %d implicit interactions (completion >= %.0f%%) to explicit score=%d",
+        n_promoted, IMPLICIT_PROMOTE_THRESHOLD * 100, IMPLICIT_PROMOTE_SCORE,
+    )
+
     df = pd.concat([explicit, implicit], ignore_index=True)
 
     known_ids = set(anime_df_processed["id"].astype(int))
@@ -337,24 +356,27 @@ def split_interactions(
             "Make sure process_interactions() parsed the createdAt field."
         )
 
-    # Sort each user's history chronologically
-    df = df.sort_values(["user_id", "created_at"], ascending=[True, True])
+    # Sort each user's history chronologically; anime_id breaks ties deterministically
+    df = df.sort_values(["user_id", "created_at", "anime_id"], ascending=[True, True, True])
 
-    # Temporal rank within EXPLICIT interactions only.
-    # Implicit (score=0) watches are always kept in train as context signals —
-    # we cannot evaluate retrieval on items the user never rated.
+    # Temporal rank within HIGH-RATED explicit interactions only.
+    # Val/test targets must be items the user liked (score >= SCORE_HIGH),
+    # so train and eval are aligned on the same objective: retrieve good recs.
+    # Implicit (score=0) watches are always kept in train as context signals.
     if "is_explicit" in df.columns:
-        explicit_df = df[df["is_explicit"]].copy()
+        explicit_df = df[
+            df["is_explicit"] & (df["score_raw"] >= SCORE_HIGH)
+        ].copy()
     else:
-        explicit_df = df.copy()
+        explicit_df = df[df["score_raw"] >= SCORE_HIGH].copy()
 
     explicit_df["_trank"] = explicit_df.groupby("user_id").cumcount(ascending=False)
 
-    # Users need at least MIN_RATINGS_PER_USER+2 explicit ratings to contribute
-    # to val/test (so the training context is non-trivial after holding 2 out).
-    user_explicit_counts = explicit_df.groupby("user_id")["_trank"].max() + 1
-    eligible = user_explicit_counts[
-        user_explicit_counts >= MIN_RATINGS_PER_USER + 2
+    # Users need at least MIN_RATINGS_PER_USER+2 high-rated items to contribute
+    # to val/test (so training context has at least 2 positives after holding 2 out).
+    user_high_counts = explicit_df.groupby("user_id")["_trank"].max() + 1
+    eligible = user_high_counts[
+        user_high_counts >= MIN_RATINGS_PER_USER + 2
     ].index
 
     test_idx = explicit_df[(explicit_df["_trank"] == 0) & explicit_df["user_id"].isin(eligible)].index
@@ -393,8 +415,16 @@ def _check_temporal_leakage(
         merged = split_df[["user_id", "created_at"]].join(
             train_max, on="user_id", how="left"
         )
-        # Allow ties (same second) — only flag strict leakage
-        bad = merged[merged["created_at"] < merged["train_max"]]
+        # Flag both strict leakage and timestamp ties (val/test at same second as train)
+        strict = merged[merged["created_at"] < merged["train_max"]]
+        ties   = merged[merged["created_at"] == merged["train_max"]]
+        bad = strict
+        if not ties.empty:
+            log.warning(
+                "Timestamp ties: %d %s rows share created_at with user's latest train item "
+                "(not leakage but worth noting)",
+                len(ties), split_name,
+            )
         if not bad.empty:
             violations += len(bad)
             log.warning(

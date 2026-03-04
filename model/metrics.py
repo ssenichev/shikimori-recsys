@@ -52,7 +52,7 @@ def evaluate_retrieval(
             for i in range(end - start):
                 seen = seen_item_idxs[start + i]
                 if seen:
-                    scores[i, seen] = -1e9
+                    scores[i, seen] = -1e4
 
         sorted_idxs = torch.argsort(scores, dim=1, descending=True)
 
@@ -131,7 +131,7 @@ def evaluate_reranker(
             seen_ids = set(ctx["anime_id"].astype(int).tolist())
             for sid in seen_ids:
                 if sid in id_to_idx:
-                    scores[id_to_idx[sid]] = -1e9
+                    scores[id_to_idx[sid]] = -1e4
 
             top_idxs = scores.topk(retrieval_k).indices.tolist()
             candidate_ids = [recommender.idx_to_id[idx] for idx in top_idxs]
@@ -175,7 +175,9 @@ def evaluate_reranker(
         results[f"NDCG@{k}"] = ndcg_at_k(ranks_arr, k)
 
     log.info(
-        in_candidates, len(eval_user_ids),
+        "Retrieval recall: %d / %d users had target in candidates (%.2f%%)",
+        in_candidates,
+        len(eval_user_ids),
         100 * in_candidates / max(len(eval_user_ids), 1),
     )
     return results

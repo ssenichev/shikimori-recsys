@@ -309,7 +309,7 @@ def train_stage3(
             attention_mask = batch["attention_mask"].to(device)
             targets = batch["targets"].to(device)
 
-            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+            with autocast("cuda"):
                 preds = reranker(input_ids, attention_mask)   # [B]
                 loss  = F.mse_loss(preds, targets) / grad_accum
 
@@ -435,7 +435,7 @@ class TwoTowerWithReranker:
                     max_length=self.max_length,
                     return_tensors="pt",
                 ).to(self.device)
-                with autocast(device_type="cuda", enabled=(self.device.type == "cuda")):
+                with autocast("cuda"):
                     embs = self.two_tower.item_tower(**enc)
                 all_embs.append(embs.cpu())
 
@@ -489,7 +489,7 @@ class TwoTowerWithReranker:
             user_idx = torch.tensor([cf_idx], dtype=torch.long).to(self.device)
 
         self.two_tower.eval()
-        with autocast(device_type="cuda", enabled=(self.device.type == "cuda")):
+        with autocast("cuda"):
             user_vec = self.two_tower.encode_user(ctx_embs, ctx_scores, ctx_mask, user_idx=user_idx)
         return user_vec.squeeze(0).cpu()
 
@@ -510,7 +510,7 @@ class TwoTowerWithReranker:
             return_tensors="pt",
         ).to(self.device)
 
-        with autocast(device_type="cuda", enabled=(self.device.type == "cuda")):
+        with autocast("cuda"):
             scores = self.reranker(enc["input_ids"], enc["attention_mask"])
 
         scored = list(zip(candidate_ids, scores.cpu().tolist()))
@@ -537,7 +537,7 @@ class TwoTowerWithReranker:
             seen_ids = set(user_history["anime_id"].astype(int).tolist())
             seen_idxs = [self.id_to_idx[a] for a in seen_ids if a in self.id_to_idx]
             for idx in seen_idxs:
-                scores[idx] = -1e9
+                scores[idx] = -1e4
 
         top_retrieval_idxs = scores.topk(retrieval_k).indices.tolist()
         candidate_ids = [self.idx_to_id[i] for i in top_retrieval_idxs]

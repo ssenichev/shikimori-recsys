@@ -365,7 +365,7 @@ def train_stage2(
                     for i, tid in enumerate(target_id_list):
                         idx = id_to_idx.get(int(tid), None)
                         if idx is not None:
-                            all_scores[i, idx] = -1e9
+                            all_scores[i, idx] = -1e4
 
                     # Also mask out other in-batch targets to avoid duplicates
                     in_batch_idxs = set()
@@ -374,7 +374,7 @@ def train_stage2(
                         if idx is not None:
                             in_batch_idxs.add(idx)
                     for idx in in_batch_idxs:
-                        all_scores[:, idx] = -1e9
+                        all_scores[:, idx] = -1e4
 
                     # Pick top-K hard negatives per user
                     _, hard_neg_indices = all_scores.topk(hard_neg_k, dim=1)  # [B, K]

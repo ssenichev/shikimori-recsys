@@ -28,7 +28,7 @@ RATING_ORDER = {
 
 SEASON_ORDER = {"winter": 0, "spring": 1, "summer": 2, "fall": 3}
 _SHIKI_TAG_RE = re.compile(r"\[/?[a-z]+=?\d*\]", re.IGNORECASE)
-MIN_RATINGS_PER_USER = 3
+MIN_RATINGS_PER_USER = 2
 SCORE_MIN, SCORE_MAX = 1, 10
 
 

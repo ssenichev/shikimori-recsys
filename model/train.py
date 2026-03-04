@@ -357,8 +357,8 @@ def train_stage2(
                     target_embs = out["target_embs"]      # [B, D]
                     B = user_embs.size(0)
 
-                    # Compute scores against full item catalog
-                    all_scores = torch.matmul(user_embs, item_matrix_device.T)  # [B, N]
+                    # Compute scores against full item catalog (detach for selection only)
+                    all_scores = torch.matmul(user_embs.detach(), item_matrix_device.T)  # [B, N]
 
                     # Mask out true target items
                     target_id_list = batch["target_ids"].tolist()
@@ -854,8 +854,8 @@ DEFAULT_CFG = {
     "s1_grad_clip": 1.0,
     # Stage 2
     "s2_epochs": 20,
-    "s2_batch_size": 256,
-    "s2_grad_accum": 1,
+    "s2_batch_size": 64,
+    "s2_grad_accum": 4,
     "s2_lr": 3e-4,
     "s2_warmup_steps": 200,
     "s2_max_length": 512,

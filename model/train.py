@@ -103,14 +103,14 @@ def train_stage1(
     total_steps = len(train_loader) * cfg["s1_epochs"]
     warmup_steps = cfg.get("s1_warmup_steps", max(1, total_steps // 10))
 
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[
-            LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps),
-            CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-7),
-        ],
-        milestones=[warmup_steps],
-    )
+    # scheduler = SequentialLR(
+    #     optimizer,
+    #     schedulers=[
+    #         LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps),
+    #         CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-7),
+    #     ],
+    #     milestones=[warmup_steps],
+    # )
 
     scaler = GradScaler(enabled=(device.type == "cuda"))
     model.to(device)
@@ -151,17 +151,18 @@ def train_stage1(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("s1_grad_clip", 1.0))
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                # scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             epoch_loss += loss.item() * grad_accum
 
             if step % 50 == 0:
                 log.info(
-                    "S1 E%d/%d  step %d/%d  loss=%.4f  d_ap=%.4f  d_an=%.4f  lr=%.2e",
+                    # "S1 E%d/%d  step %d/%d  loss=%.4f  d_ap=%.4f  d_an=%.4f  lr=%.2e",
+                    "S1 E%d/%d  step %d/%d  loss=%.4f  d_ap=%.4f  d_an=%.4f",
                     epoch, cfg["s1_epochs"], step, len(train_loader),
                     loss.item() * grad_accum, out["d_ap"].item(), out["d_an"].item(),
-                    scheduler.get_last_lr()[0],
+                    # scheduler.get_last_lr()[0],
                 )
 
         avg_loss = epoch_loss / len(train_loader)

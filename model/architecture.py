@@ -59,14 +59,33 @@ class LoRALinear(nn.Module):
         return base + lora
 
 
-def apply_lora_to_encoder(model: nn.Module, rank: int, alpha: float, dropout: float):
+LORA_TARGETS_QV = ("query", "value", "q_proj", "v_proj")
+LORA_TARGETS_QV_FFN = LORA_TARGETS_QV + ("intermediate.dense", "output.dense")
+
+
+def apply_lora_to_encoder(
+    model: nn.Module,
+    rank: int,
+    alpha: float,
+    dropout: float,
+    target_modules: str = "qv_ffn",
+):
+    """Apply LoRA adapters to selected linear layers.
+
+    target_modules:
+        "qv"      — query + value projections only (standard)
+        "qv_ffn"  — query + value + FFN intermediate/output (recommended for
+                     embedding models where FFN shapes the representation space)
+    """
+    targets = LORA_TARGETS_QV if target_modules == "qv" else LORA_TARGETS_QV_FFN
+
     for p in model.parameters():
         p.requires_grad_(False)
 
     replaced = 0
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and any(
-            k in name for k in ("query", "value", "q_proj", "v_proj")
+            k in name for k in targets
         ):
             parent_name, attr = name.rsplit(".", 1)
             parent = model.get_submodule(parent_name)
@@ -87,6 +106,7 @@ class ItemTower(nn.Module):
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
+        lora_targets: str = "qv_ffn",  # "qv" | "qv_ffn"
         pooling: str = "mean",
         gradient_checkpointing: bool = True,
     ):
@@ -101,8 +121,9 @@ class ItemTower(nn.Module):
                 p.requires_grad_(False)
         elif freeze_mode == "lora":
             n = apply_lora_to_encoder(self.encoder, rank=lora_rank,
-                                      alpha=lora_alpha, dropout=lora_dropout)
-            print(f"[ItemTower] Applied LoRA to {n} linear layers")
+                                      alpha=lora_alpha, dropout=lora_dropout,
+                                      target_modules=lora_targets)
+            print(f"[ItemTower] Applied LoRA to {n} linear layers (targets={lora_targets})")
 
         if gradient_checkpointing:
             if hasattr(self.encoder, "gradient_checkpointing_enable"):
@@ -210,6 +231,7 @@ class TwoTowerModel(nn.Module):
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
+        lora_targets: str = "qv_ffn",
         pooling: str = "mean",
         gradient_checkpointing: bool = True,
         n_items: int = 0,
@@ -229,6 +251,7 @@ class TwoTowerModel(nn.Module):
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
+            lora_targets=lora_targets,
             pooling=pooling,
             gradient_checkpointing=gradient_checkpointing,
         )
@@ -354,6 +377,7 @@ class ContrastiveEncoder(nn.Module):
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
+        lora_targets: str = "qv_ffn",
         base_margin: float = 0.3,
         gradient_checkpointing: bool = True,
     ):
@@ -367,6 +391,7 @@ class ContrastiveEncoder(nn.Module):
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
+            lora_targets=lora_targets,
             gradient_checkpointing=gradient_checkpointing,
         )
 

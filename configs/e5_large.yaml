@@ -1,0 +1,18 @@
+# Example: Train with multilingual-e5-large encoder
+# Usage: python main.py --config-name=e5_large
+
+defaults:
+  - default
+  - _self_
+
+encoder: intfloat/multilingual-e5-large
+
+# Larger encoder needs smaller batches to fit in VRAM
+stage1:
+  batch_size: 16
+  grad_accum: 8
+
+stage2:
+  batch_size: 32
+  grad_accum: 4
+  encode_batch: 64

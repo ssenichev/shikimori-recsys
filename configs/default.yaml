@@ -1,0 +1,93 @@
+# ============================================================================
+# Shikimori RecSys — Default Training Configuration
+# ============================================================================
+#
+# Override from CLI:
+#   python main.py encoder=intfloat/multilingual-e5-large stage2.batch_size=128
+#   python main.py skip_stage1=true skip_stage3=true
+#   python main.py hpo.tower=true hpo.tower_trials=30
+#
+# Or create a new YAML in configs/ and use:
+#   python main.py --config-name=my_experiment
+
+seed: 42
+encoder: intfloat/multilingual-e5-base
+freeze_mode: lora          # all | lora | none
+pooling: mean
+num_workers: 2
+
+# Paths
+data:
+  raw_dir: raw_data
+  processed_dir: processed_data
+  run_preprocessing: true
+
+output_dir: checkpoints
+
+# Stage toggles
+skip_stage1: false
+skip_stage2: false
+skip_stage3: false
+
+# HPO
+hpo:
+  tower: false
+  tower_trials: 30
+  reranker: false
+  reranker_trials: 20
+
+# ── Model architecture ──
+model:
+  proj_dim: 256
+  nhead: 4
+  temperature: 0.07
+  dropout: 0.1
+  weight_decay: 0.01
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_targets: qv_ffn    # qv = attention only, qv_ffn = attention + FFN (recommended)
+  cf_dim: 128
+  user_tower_layers: 2
+
+# ── Stage 1: Contrastive fine-tuning ──
+stage1:
+  epochs: 7
+  batch_size: 32
+  grad_accum: 4
+  lr: 2e-5
+  warmup_steps: 100
+  max_length: 512
+  neg_per_user: 5
+  grad_clip: 1.0
+
+# ── Stage 2: Two-Tower training ──
+stage2:
+  epochs: 10
+  batch_size: 64
+  grad_accum: 2
+  lr: 3e-5
+  warmup_steps: 200
+  max_length: 512
+  max_history: 50
+  grad_clip: 1.0
+  encode_batch: 128
+  hard_neg_k: 128
+
+# ── Stage 3: Cross-encoder reranker ──
+stage3:
+  encoder: BAAI/bge-reranker-v2-m3
+  pretrained_reranker: true
+  epochs: 3
+  batch_size: 32
+  grad_accum: 2
+  lr: 2e-5
+  warmup_steps: 50
+  max_length: 512
+  grad_clip: 1.0
+  neg_per_user: 3
+  retrieval_k: 100
+
+# ── Evaluation ──
+eval:
+  ks: [5, 10, 20]

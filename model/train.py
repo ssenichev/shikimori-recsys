@@ -636,6 +636,7 @@ def run_hpo(
             freeze_mode=base_cfg.get("freeze_mode", "lora"),
             lora_rank=cfg["lora_rank"],
             lora_alpha=float(cfg["lora_rank"]) * 2,
+            lora_targets=cfg.get("lora_targets", "qv_ffn"),
             n_items=n_items_cf if cf_dim > 0 else 0,
             n_users=n_users_cf if cf_dim > 0 else 0,
             cf_dim=cf_dim,
@@ -875,6 +876,7 @@ DEFAULT_CFG = {
     "lora_rank": 8,
     "lora_alpha": 16.0,
     "lora_dropout": 0.05,
+    "lora_targets": "qv_ffn",
     "freeze_mode": "lora",
     "encoder": "intfloat/multilingual-e5-base",
     "pooling": "mean",
@@ -1000,6 +1002,7 @@ def main():
             lora_rank=cfg["lora_rank"],
             lora_alpha=cfg.get("lora_alpha", 16.0),
             lora_dropout=cfg.get("lora_dropout", 0.05),
+            lora_targets=cfg.get("lora_targets", "qv_ffn"),
             base_margin=cfg.get("base_margin", 0.3),
         )
         s1_model = train_stage1(
@@ -1029,6 +1032,7 @@ def main():
             lora_rank=cfg["lora_rank"],
             lora_alpha=cfg.get("lora_alpha", 16.0),
             lora_dropout=cfg.get("lora_dropout", 0.05),
+            lora_targets=cfg.get("lora_targets", "qv_ffn"),
             pooling=cfg.get("pooling", "mean"),
             n_items=n_items_cf,
             n_users=n_users_cf,

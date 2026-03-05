@@ -1,4 +1,3 @@
-import argparse
 import json
 import logging
 import os
@@ -847,264 +846,85 @@ def run_hpo_reranker(
 
     return best_params
 
-DEFAULT_CFG = {
-    # Stage 1
-    "s1_epochs": 7,
-    "s1_batch_size": 32,
-    "s1_grad_accum": 4, 
-    "s1_lr": 2e-5,
-    "s1_warmup_steps": 100,
-    "s1_max_length": 512,
-    "s1_neg_per_user": 5,
-    "s1_grad_clip": 1.0,
-    # Stage 2
-    "s2_epochs": 10,
-    "s2_batch_size": 64,
-    "s2_grad_accum": 2,
-    "s2_lr": 3e-5,
-    "s2_warmup_steps": 200,
-    "s2_max_length": 512,
-    "s2_max_history": 50,
-    "s2_grad_clip": 1.0,
-    "s2_encode_batch": 128,
-    "s2_cache_refresh_steps": 50,
-    # Shared
-    "proj_dim": 256,
-    "nhead": 4,
-    "temperature": 0.07,
-    "dropout": 0.1,
-    "weight_decay": 0.01,
-    "lora_rank": 8,
-    "lora_alpha": 16.0,
-    "lora_dropout": 0.05,
-    "lora_targets": "qv_ffn",
-    "freeze_mode": "lora",
-    "encoder": "intfloat/multilingual-e5-base",
-    "pooling": "mean",
-    "cf_dim": 128,
-    "user_tower_layers": 2,
-    "s2_hard_neg_k": 128,
-    "eval_ks": [5, 10, 20],
-    "num_workers": 2,
-    # Stage 3 — cross-encoder reranker
-    "s3_encoder": "BAAI/bge-reranker-v2-m3",
-    "s3_pretrained_reranker": True,
-    "s3_epochs": 3,
-    "s3_batch_size": 32,
-    "s3_grad_accum": 2,
-    "s3_lr": 2e-5,
-    "s3_warmup_steps": 50,
-    "s3_max_length": 512,
-    "s3_grad_clip": 1.0,
-    "s3_neg_per_user": 3,
-    "retrieval_k": 100,
-}
+def load_default_cfg(config_dir: str = None) -> dict:
+    """Load default config from configs/default.yaml and flatten into a flat dict.
+
+    This is the single source of truth for all hyperparameters.
+    Used by both main.py (via Hydra) and train.ipynb (via this function).
+    """
+    import yaml
+
+    if config_dir is None:
+        # Resolve relative to the project root (parent of model/)
+        config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
+
+    yaml_path = os.path.join(config_dir, "default.yaml")
+    with open(yaml_path) as f:
+        raw = yaml.safe_load(f)
+
+    def _float(v):
+        """Ensure scientific notation strings like '2e-5' are parsed as float."""
+        return float(v)
+
+    s1 = raw["stage1"]
+    s2 = raw["stage2"]
+    s3 = raw["stage3"]
+    m = raw["model"]
+
+    cfg = {
+        # Stage 1
+        "s1_epochs": s1["epochs"],
+        "s1_batch_size": s1["batch_size"],
+        "s1_grad_accum": s1["grad_accum"],
+        "s1_lr": _float(s1["lr"]),
+        "s1_warmup_steps": s1["warmup_steps"],
+        "s1_max_length": s1["max_length"],
+        "s1_neg_per_user": s1["neg_per_user"],
+        "s1_grad_clip": s1["grad_clip"],
+        # Stage 2
+        "s2_epochs": s2["epochs"],
+        "s2_batch_size": s2["batch_size"],
+        "s2_grad_accum": s2["grad_accum"],
+        "s2_lr": _float(s2["lr"]),
+        "s2_warmup_steps": s2["warmup_steps"],
+        "s2_max_length": s2["max_length"],
+        "s2_max_history": s2["max_history"],
+        "s2_grad_clip": s2["grad_clip"],
+        "s2_encode_batch": s2["encode_batch"],
+        "s2_hard_neg_k": s2["hard_neg_k"],
+        # Shared / model
+        "proj_dim": m["proj_dim"],
+        "nhead": m["nhead"],
+        "temperature": m["temperature"],
+        "dropout": m["dropout"],
+        "weight_decay": m["weight_decay"],
+        "lora_rank": m["lora_rank"],
+        "lora_alpha": m["lora_alpha"],
+        "lora_dropout": m["lora_dropout"],
+        "lora_targets": m["lora_targets"],
+        "cf_dim": m["cf_dim"],
+        "user_tower_layers": m["user_tower_layers"],
+        "freeze_mode": raw["freeze_mode"],
+        "encoder": raw["encoder"],
+        "pooling": raw["pooling"],
+        "eval_ks": list(raw["eval"]["ks"]),
+        "num_workers": raw["num_workers"],
+        # Stage 3 — cross-encoder reranker
+        "s3_encoder": s3["encoder"],
+        "s3_pretrained_reranker": s3["pretrained_reranker"],
+        "s3_epochs": s3["epochs"],
+        "s3_batch_size": s3["batch_size"],
+        "s3_grad_accum": s3["grad_accum"],
+        "s3_lr": _float(s3["lr"]),
+        "s3_warmup_steps": s3["warmup_steps"],
+        "s3_max_length": s3["max_length"],
+        "s3_grad_clip": s3["grad_clip"],
+        "s3_neg_per_user": s3["neg_per_user"],
+        "retrieval_k": s3["retrieval_k"],
+    }
+    return cfg
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train the two-tower anime recommender")
 
-    parser.add_argument("--processed_dir", default="./processed_data",
-                        help="Output of preprocessing.py")
-    parser.add_argument("--output_dir",    default="./checkpoints",
-                        help="Where to save model checkpoints and HPO results")
-    parser.add_argument("--encoder",       default="intfloat/multilingual-e5-base",
-                        help="HuggingFace encoder model ID")
-    parser.add_argument("--freeze_mode",   default="lora",
-                        choices=["all", "lora", "none"],
-                        help="Encoder freeze strategy")
-
-    # Stage toggles
-    parser.add_argument("--skip_stage1", action="store_true",
-                        help="Skip contrastive fine-tuning (Stage 1)")
-    parser.add_argument("--skip_stage2", action="store_true",
-                        help="Skip two-tower training (Stage 2)")
-    parser.add_argument("--skip_stage3", action="store_true",
-                        help="Skip cross-encoder reranker training (Stage 3)")
-
-    parser.add_argument("--hpo", action="store_true",
-                        help="Run Optuna HPO before the final training run")
-    parser.add_argument("--hpo_trials", type=int, default=30,
-                        help="Number of Optuna trials")
-
-    # Quick-override of key hypers (optional)
-    parser.add_argument("--proj_dim", type=int, default=None)
-    parser.add_argument("--nhead", type=int, default=None)
-    parser.add_argument("--temperature", type=float, default=None)
-    parser.add_argument("--s2_lr", type=float, default=None)
-    parser.add_argument("--s2_batch_size", type=int, default=None)
-    parser.add_argument("--s2_epochs", type=int, default=None)
-    parser.add_argument("--s1_epochs", type=int, default=None)
-    parser.add_argument("--lora_rank", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-
-    args = parser.parse_args()
-
-    # Reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Device: %s", device)
-
-    processed_dir = Path(args.processed_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info("Loading processed data from %s", processed_dir)
-    anime_df = pd.read_parquet(processed_dir / "anime_processed.parquet")
-    train_df = pd.read_parquet(processed_dir / "train_interactions.parquet")
-    val_df = pd.read_parquet(processed_dir / "val_interactions.parquet")
-    test_df  = pd.read_parquet(processed_dir / "test_interactions.parquet")
-
-    log.info(
-        "Loaded — anime: %d  train: %d  val: %d  test: %d",
-        len(anime_df), len(train_df), len(val_df), len(test_df),
-    )
-
-    cfg = {**DEFAULT_CFG}
-    cfg["freeze_mode"] = args.freeze_mode
-    for key in ["proj_dim", "nhead", "temperature", "s2_lr", "s2_batch_size",
-                "s2_epochs", "s1_epochs", "lora_rank"]:
-        val = getattr(args, key)
-        if val is not None:
-            cfg[key] = val
-
-    if args.hpo:
-        best_params = run_hpo(
-            train_df, val_df, anime_df,
-            base_cfg=cfg,
-            output_dir=output_dir,
-            device=device,
-            n_trials=args.hpo_trials,
-            encoder_name=args.encoder,
-        )
-        cfg.update(best_params)
-        cfg["s2_epochs"] = DEFAULT_CFG["s2_epochs"]
-        cfg["s1_epochs"] = DEFAULT_CFG["s1_epochs"]
-        log.info("Running final training with HPO-optimised hyperparameters")
-
-    # Save final config
-    with open(output_dir / "train_config.json", "w") as f:
-        json.dump(cfg, f, indent=2)
-
-    # ── Tokeniser ──
-    tokenizer = AutoTokenizer.from_pretrained(args.encoder)
-
-    # ── Stage 1: Contrastive fine-tuning ──
-    stage1_weights_path = output_dir / "stage1_best.pt"
-
-    if not args.skip_stage1:
-        s1_model = ContrastiveEncoder(
-            encoder_name=args.encoder,
-            proj_dim=cfg["proj_dim"],
-            dropout=cfg["dropout"],
-            freeze_mode=cfg["freeze_mode"],
-            lora_rank=cfg["lora_rank"],
-            lora_alpha=cfg.get("lora_alpha", 16.0),
-            lora_dropout=cfg.get("lora_dropout", 0.05),
-            lora_targets=cfg.get("lora_targets", "qv_ffn"),
-            base_margin=cfg.get("base_margin", 0.3),
-        )
-        s1_model = train_stage1(
-            s1_model, tokenizer, train_df, val_df, anime_df,
-            cfg, output_dir, device,
-        )
-        torch.save(s1_model.tower.state_dict(), stage1_weights_path)
-        log.info("Stage 1 encoder weights saved to %s", stage1_weights_path)
-    else:
-        log.info("Skipping Stage 1 (--skip_stage1)")
-
-    if not args.skip_stage2:
-        # Build CF mappings
-        item_id_to_cf_idx, user_id_to_cf_idx, n_items_cf, n_users_cf = build_cf_mappings(anime_df, train_df)
-        cf_dim = cfg.get("cf_dim", 0)
-        if cf_dim == 0:
-            n_items_cf = 0
-            n_users_cf = 0
-
-        model = TwoTowerModel(
-            encoder_name=args.encoder,
-            proj_dim=cfg["proj_dim"],
-            nhead=cfg["nhead"],
-            temperature=cfg["temperature"],
-            dropout=cfg["dropout"],
-            freeze_mode=cfg["freeze_mode"],
-            lora_rank=cfg["lora_rank"],
-            lora_alpha=cfg.get("lora_alpha", 16.0),
-            lora_dropout=cfg.get("lora_dropout", 0.05),
-            lora_targets=cfg.get("lora_targets", "qv_ffn"),
-            pooling=cfg.get("pooling", "mean"),
-            n_items=n_items_cf,
-            n_users=n_users_cf,
-            cf_dim=cf_dim,
-            user_tower_layers=cfg.get("user_tower_layers", 1),
-        )
-
-        if stage1_weights_path.exists() and not args.skip_stage1:
-            log.info("Loading Stage 1 encoder weights into item tower...")
-            state = torch.load(stage1_weights_path, map_location="cpu")
-            missing, unexpected = model.item_tower.load_state_dict(state, strict=False)
-            if missing:
-                log.warning("Missing keys when loading S1→S2: %s", missing)
-            if unexpected:
-                log.warning("Unexpected keys when loading S1→S2: %s", unexpected)
-
-        model, best_val_metrics = train_stage2(
-            model, tokenizer, train_df, val_df, anime_df,
-            cfg, output_dir, device,
-        )
-
-        log.info("Running final evaluation on held-out test set...")
-        train_and_val = pd.concat([train_df, val_df], ignore_index=True)
-        test_metrics = evaluate_epoch(
-            model, tokenizer, test_df, anime_df, cfg, device,
-            ks=cfg["eval_ks"],
-            train_df=train_and_val,
-        )
-        log.info("TEST METRICS: %s", format_metrics(test_metrics, prefix=""))
-
-        results = {
-            "val_metrics":  best_val_metrics,
-            "test_metrics": test_metrics,
-            "config":       cfg,
-        }
-        with open(output_dir / "final_results.json", "w") as f:
-            json.dump(results, f, indent=2)
-        log.info("Final results saved to %s/final_results.json", output_dir)
-
-        final_model_dir = output_dir / "final_model"
-        final_model_dir.mkdir(exist_ok=True)
-        torch.save(model.state_dict(), final_model_dir / "model.pt")
-        tokenizer.save_pretrained(str(final_model_dir))
-        with open(final_model_dir / "config.json", "w") as f:
-            json.dump(cfg, f, indent=2)
-        log.info("Inference-ready model saved to %s", final_model_dir)
-
-    if not args.skip_stage3 and not args.skip_stage2:
-        log.info("Training Stage 3: cross-encoder reranker...")
-        s3_tokenizer = AutoTokenizer.from_pretrained(cfg["s3_encoder"])
-        reranker = CrossEncoderReranker(
-            encoder_name=cfg["s3_encoder"],
-            dropout=cfg.get("dropout", 0.1),
-            pretrained_reranker=cfg.get("s3_pretrained_reranker", False),
-        )
-        reranker = train_stage3(
-            reranker, s3_tokenizer,
-            train_df=train_df, val_df=val_df,
-            anime_df=anime_df, cfg=cfg,
-            output_dir=output_dir, device=device,
-        )
-        reranker_dir = output_dir / "final_model"
-        reranker_dir.mkdir(exist_ok=True)
-        torch.save(reranker.state_dict(), reranker_dir / "reranker.pt")
-        s3_tokenizer.save_pretrained(str(reranker_dir / "reranker_tokenizer"))
-        log.info("Reranker saved to %s", reranker_dir)
-    elif args.skip_stage3:
-        log.info("Skipping Stage 3 (--skip_stage3)")
-
-    log.info("All done.")
-
-
-if __name__ == "__main__":
-    main()
+# Backward-compatible alias so `from model.train import DEFAULT_CFG` still works
+DEFAULT_CFG = load_default_cfg()

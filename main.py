@@ -40,7 +40,7 @@ from model.train import (
     build_cf_mappings,
     run_hpo,
     run_hpo_reranker,
-    DEFAULT_CFG,
+    load_default_cfg,
 )
 from model.metrics import evaluate_reranker, format_metrics
 
@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 
 def _build_train_cfg(hydra_cfg: DictConfig) -> dict:
     """Flatten Hydra config into the flat dict expected by train functions."""
-    cfg = {**DEFAULT_CFG}
+    cfg = load_default_cfg()
 
     cfg["encoder"] = hydra_cfg.encoder
     cfg["freeze_mode"] = hydra_cfg.freeze_mode
